@@ -1,0 +1,10 @@
+| Method in paper                       | Type                           | GitHub                                                                                           |
+| ------------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------ |
+| Direct                                | CoT without retrieval          | (no repo – just prompting)                                                                       |
+| Std-RAG                               | standard single-retrieval RAG  | many frameworks (LangChain / LlamaIndex etc.)                                                    |
+| **IR-CoT**                            | iterative retrieval + CoT      | [https://github.com/StonyBrookNLP/ircot](https://github.com/StonyBrookNLP/ircot)                 |
+| **MA-RAG**                            | multi-agent RAG                | ⚠️ no official repo found                                                                        |
+| **Search-O1**                         | agentic search reasoning model | [https://github.com/RUC-NLPIR/Search-o1](https://github.com/RUC-NLPIR/Search-o1)                 |
+| **Search-R1**                         | RL reasoning + search training | [https://github.com/PeterGriffinJin/Search-R1](https://github.com/PeterGriffinJin/Search-R1)     |
+| **R-Search**                          | RL reasoning-search framework  | [https://github.com/QingFei1/R-Search](https://github.com/QingFei1/R-Search)                     |
+| **S-DeepSearch** (SimpleDeepSearcher) | SFT-trained deep search agent  | [https://github.com/RUCAIBox/SimpleDeepSearcher](https://github.com/RUCAIBox/SimpleDeepSearcher) |
