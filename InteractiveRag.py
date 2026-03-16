@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -25,12 +26,29 @@ class LLMBackend(Protocol):
 
 
 class OpenAIBackend:
-	"""Minimal backend wrapper for OpenAI chat-completions."""
+	"""Minimal backend wrapper for OpenAI chat-completions.
 
-	def __init__(self, model: str = "qwen3-8b"):
+	For a locally-served model (vLLM, Ollama, LM Studio, etc.) pass
+	the server's base_url and use any non-empty string as api_key.
+	Example:
+	    OpenAIBackend(model="qwen3-8b",
+	                  base_url="http://localhost:8000/v1",
+	                  api_key="local")
+	"""
+
+	def __init__(
+		self,
+		model: str = "qwen3-8b",
+		api_key: Optional[str] = None,
+		base_url: Optional[str] = None,
+	):
+		import os
 		from openai import OpenAI
 
-		self.client = OpenAI()
+		resolved_key = api_key or os.environ.get("OPENAI_API_KEY", "local")
+		resolved_url = base_url or os.environ.get("OPENAI_BASE_URL", None)
+
+		self.client = OpenAI(api_key=resolved_key, base_url=resolved_url)
 		self.model = model
 
 	def generate(self, prompt: str) -> str:
@@ -62,12 +80,13 @@ class QwenLocalBackend:
 		self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 		self.model = AutoModelForCausalLM.from_pretrained(
 			model_name,
-			torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+			dtype=torch.float16 if self.device == "cuda" else torch.float32,
 			device_map="auto" if self.device == "cuda" else None,
 			trust_remote_code=True,
 		)
 		if self.device == "cpu":
 			self.model = self.model.to(self.device)
+		print(f"[QwenLocalBackend] device={self.device}, model device={next(self.model.parameters()).device}")
 
 	def generate(self, prompt: str) -> str:
 		messages = [{"role": "user", "content": prompt}]
@@ -86,6 +105,41 @@ class QwenLocalBackend:
 
 		new_tokens = outputs[0][inputs["input_ids"].shape[1]:]
 		return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
+
+# ============================================================
+# 0b) Verbose LLM wrapper
+# ============================================================
+
+class VerboseLLMWrapper:
+	"""
+	Wraps any LLMBackend and prints each prompt and response to stdout.
+	Set verbose=False to silence without removing the wrapper.
+	"""
+
+	_call_count: int = 0
+
+	def __init__(self, backend: LLMBackend, verbose: bool = True):
+		self.backend = backend
+		self.verbose = verbose
+
+	def generate(self, prompt: str) -> str:
+		VerboseLLMWrapper._call_count += 1
+		if self.verbose:
+			sep = "=" * 72
+			print(f"\n{sep}")
+			print(f"[LLM CALL #{VerboseLLMWrapper._call_count}] PROMPT:")
+			print(sep)
+			print(prompt)
+			print(f"{sep}")
+		response = self.backend.generate(prompt)
+		if self.verbose:
+			sep2 = "-" * 72
+			print(f"[LLM CALL #{VerboseLLMWrapper._call_count}] RESPONSE:")
+			print(sep2)
+			print(response)
+			print(f"{sep2}\n")
+		return response
 
 
 # ============================================================
@@ -470,14 +524,51 @@ class CorpusInteractionEngine:
 # ============================================================
 
 def safe_json_parse(text: str) -> Dict[str, Any]:
-	text = text.strip()
+	def _extract_balanced_json_object(src: str) -> Optional[str]:
+		start = src.find("{")
+		if start < 0:
+			return None
+
+		depth = 0
+		in_str = False
+		escape = False
+		for i in range(start, len(src)):
+			ch = src[i]
+			if in_str:
+				if escape:
+					escape = False
+				elif ch == "\\":
+					escape = True
+				elif ch == '"':
+					in_str = False
+				continue
+
+			if ch == '"':
+				in_str = True
+			elif ch == "{":
+				depth += 1
+			elif ch == "}":
+				depth -= 1
+				if depth == 0:
+					return src[start : i + 1]
+		return None
+
+	cleaned = (text or "").strip()
+	# Remove optional reasoning tags and markdown fences before parsing.
+	cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL)
+	cleaned = cleaned.replace("```json", "").replace("```", "").strip()
+
 	try:
-		return json.loads(text)
+		obj = json.loads(cleaned)
+		if isinstance(obj, dict):
+			return obj
+		raise ValueError("Parsed JSON is not an object")
 	except Exception:
-		s = text.find("{")
-		e = text.rfind("}")
-		if s >= 0 and e >= s:
-			return json.loads(text[s : e + 1])
+		candidate = _extract_balanced_json_object(cleaned)
+		if candidate is not None:
+			obj = json.loads(candidate)
+			if isinstance(obj, dict):
+				return obj
 		raise
 
 
@@ -528,7 +619,34 @@ Return STRICT JSON only:
 	]
 }}
 """.strip()
-		return safe_json_parse(self.llm.generate(prompt))
+		raw = self.llm.generate(prompt)
+		try:
+			return safe_json_parse(raw)
+		except Exception:
+			repair_prompt = f"""
+Convert the following content to STRICT JSON only, no markdown, no explanation.
+Schema:
+{{
+	"analysis": "string",
+	"steps": ["Step 1: ...", "Step 2: ..."]
+}}
+
+Content:
+{raw}
+""".strip()
+			try:
+				fixed = safe_json_parse(self.llm.generate(repair_prompt))
+				if "analysis" in fixed and isinstance(fixed.get("steps"), list):
+					return fixed
+			except Exception:
+				pass
+			return {
+				"analysis": "Plan the retrieval by first identifying the key fact, then collecting supporting context.",
+				"steps": [
+					"Step 1: Find the primary fact directly answering the query.",
+					"Step 2: Retrieve supporting evidence related to that fact.",
+				],
+			}
 
 
 class AdaptiveReasoner:
@@ -563,7 +681,35 @@ Return STRICT JSON only:
 	"strategy": "specific next-step strategy"
 }}
 """.strip()
-		return safe_json_parse(self.llm.generate(prompt))
+		raw = self.llm.generate(prompt)
+		try:
+			parsed = safe_json_parse(raw)
+		except Exception:
+			repair_prompt = f"""
+Convert the following content to STRICT JSON only, no markdown, no explanation.
+Schema:
+{{
+	"directive": "proceed" | "refine" | "conclude",
+	"thought": "string",
+	"strategy": "string"
+}}
+
+Content:
+{raw}
+""".strip()
+			try:
+				parsed = safe_json_parse(self.llm.generate(repair_prompt))
+			except Exception:
+				parsed = {}
+
+		directive = parsed.get("directive", "refine")
+		if directive not in {"proceed", "refine", "conclude"}:
+			directive = "refine"
+		return {
+			"directive": directive,
+			"thought": str(parsed.get("thought", "Need a clearer retrieval step based on current evidence.")),
+			"strategy": str(parsed.get("strategy", "Run a focused semantic search for the missing facts.")),
+		}
 
 
 class Executor:
@@ -574,36 +720,43 @@ class Executor:
 		"""
 		Returns text containing:
 		- <think>...</think>
-		- one or multiple <tool_call>{json}</tool_call> (max 2)
+		- one <tool_call>{json}</tool_call> that calls execute_search_plan
 		OR final answer block <final_answer>...</final_answer>
 		"""
 		prompt = f"""
-You are a specialized searching execution agent.
-Your only action choices are:
-1) call search primitives (tool-calls), or
-2) provide final answer.
+You are a specialized searching execution agent. You will be presented with a user's query
+and prior search results with analysis. Your sole purpose is to perform one of two specific
+actions: either call the execute_search_plan tool or provide the final answer.
 
-Available primitives:
-- semantic_search(query)              # required query parameter for semantic retrieval
-- exact_search(keywords)
-- weighted_fusion(ws,we)
-- entity_match(entity, sub_query)
-- include_docs(doc_ids)
-- exclude_docs(doc_ids)
-- adjust_scale(n)
+The execute_search_plan tool accepts an action list that implements the paper's retrieval controls:
+- semantic_search(query): semantic retrieval; query is required.
+- exact_search(keywords): lexical/BM25 retrieval using keywords.
+- weighted_fusion(ws,we): adjust semantic-vs-exact weighting.
+- entity_match(entity, sub_query): anchored entity snippet retrieval.
+- include_docs(doc_ids): force-include specific documents.
+- exclude_docs(doc_ids): filter out noisy documents.
+- adjust_scale(n): adjust context budget (top chunks).
 
 Output contract:
 - If evidence is sufficient, output ONLY <final_answer>...</final_answer>.
 - Otherwise output exactly:
   (a) one <think>...</think>
-  (b) 1 to 2 tool-call blocks
+  (b) one <tool_call>{json}</tool_call>
 - Tool-call tags:
-  preferred: <tool_call>{{...}}</tool_call>
-  compatible: <tool call>{{...}}</tool call>
-- Each call JSON schema:
-  {{"name":"primitive_name", "args":{{...}}}}
-- Keep arguments clear and specific.
-- If no explicit semantic query was provided by strategy, formulate one.
+	preferred: <tool_call>{{...}}</tool_call>
+	compatible: <tool call>{{...}}</tool call>
+- Tool-call JSON schema:
+	{{
+		"name": "execute_search_plan",
+		"args": {{
+			"actions": [
+				{{"name": "semantic_search", "args": {{"query": "..."}}}},
+				{{"name": "exact_search", "args": {{"keywords": "..."}}}}
+			]
+		}}
+	}}
+- You may include multiple actions in one call when they are independent/concurrent.
+
 
 Query: {query}
 Directive: {reasoner_output.get('directive', 'refine')}
@@ -637,6 +790,12 @@ class InteractiveRAGAgent:
 		self.global_planner = GlobalPlanner(llm)
 		self.reasoner = AdaptiveReasoner(llm)
 		self.executor = Executor(llm)
+
+	def execute_search_plan(self, actions: List[Dict[str, Any]]) -> Dict[str, Any]:
+		"""Execute one bundled retrieval plan (potentially multiple concurrent actions)."""
+		if not isinstance(actions, list):
+			actions = []
+		return self.engine.execute_actions(actions)
 
 	@staticmethod
 	def _parse_thought(executor_text: str) -> str:
@@ -690,8 +849,20 @@ class InteractiveRAGAgent:
 					"retrieved_docs": state["retrieved"],
 				}
 
-			actions = extract_tool_calls(executor_text)
-			tool_payload = self.engine.execute_actions(actions)
+			raw_calls = extract_tool_calls(executor_text)
+			actions: List[Dict[str, Any]] = []
+			for c in raw_calls:
+				name = c.get("name", "")
+				args = c.get("args", {})
+				if name == "execute_search_plan" and isinstance(args, dict):
+					bundle = args.get("actions", [])
+					if isinstance(bundle, list):
+						actions.extend(bundle)
+				else:
+					# Backward compatibility for direct primitive tool calls.
+					actions.append(c)
+
+			tool_payload = self.execute_search_plan(actions)
 
 			# Aggregate one consolidated context:
 			# unified ranked chunks + concise entity snippets
@@ -721,10 +892,11 @@ class InteractiveRAGAgent:
 			# progress plan loosely
 			if reason.get("directive") == "proceed":
 				state["step_idx"] += 1
-
-			# finish if last plan step likely done
-			if state["step_idx"] >= len(plan.get("steps", [])):
-				break
+			# Keep iterating until reasoner explicitly concludes or max_steps is reached.
+			# We clamp step_idx for prompt readability once all plan steps are traversed.
+			plan_steps = plan.get("steps", [])
+			if plan_steps:
+				state["step_idx"] = min(state["step_idx"], len(plan_steps) - 1)
 
 		final_answer = self.executor.finalize(user_query, state["retrieved"])
 		return {
@@ -752,16 +924,26 @@ if __name__ == "__main__":
 	# - Top chunks: 3
 	# - LLM: Qwen3-8B
 	#
-	# Option A: local model
-	# llm = QwenLocalBackend(model_name="Qwen/Qwen3-8B")
+	# Option A: local model (no server required — loads weights directly)
+	base_llm = QwenLocalBackend(model_name="Qwen/Qwen3-8B")
 	#
 	# Option B: OpenAI-compatible endpoint serving Qwen3-8B
-	llm = OpenAIBackend(model="qwen3-8b")
+	# Requires a running server (vLLM, Ollama, LM Studio, etc.)
+	# Set OPENAI_BASE_URL to your server, e.g. http://localhost:8000/v1
+	# Set OPENAI_API_KEY to your key (or any non-empty string for local servers)
+	# base_llm = OpenAIBackend(
+	# 	model="Qwen/Qwen3-8B",
+	# 	base_url=os.environ.get("OPENAI_BASE_URL", "http://localhost:8000/v1"),
+	# 	api_key=os.environ.get("OPENAI_API_KEY", "local"),
+	# )
+
+	# Wrap with verbose logger — set verbose=False to silence prompt printing
+	llm = VerboseLLMWrapper(base_llm, verbose=True)
 
 	engine = CorpusInteractionEngine(docs)
 	agent = InteractiveRAGAgent(engine=engine, llm=llm)
 
-	out = agent.query("What is the capital of France and which landmark is there?")
+	out = agent.query("What is the capital of France and which landmark is there?", max_steps=7)
 	print("Answer:", out["answer"])
 	print("Plan:", json.dumps(out["plan"], indent=2, ensure_ascii=False))
 	print("History steps:", len(out["history"]))

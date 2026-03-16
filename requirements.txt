@@ -1,0 +1,7 @@
+numpy
+torch
+transformers
+sentence-transformers
+chromadb
+openai
+accelerate
